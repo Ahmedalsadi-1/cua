@@ -3,5 +3,5 @@
   "description": "Get started with Cua",
   "defaultOpen": true,
   "icon": "Rocket",
-  "pages": ["../index", "quickstart"]
+  "pages": ["../index", "quickstart", "vm-orchestration", "frontend-feedback-loop", "troubleshooting"]
 }
