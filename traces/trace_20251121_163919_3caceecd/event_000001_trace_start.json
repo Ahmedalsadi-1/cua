@@ -1,0 +1,23 @@
+{
+  "type": "trace_start",
+  "timestamp": 1763743159.1776574,
+  "relative_time": 3.814697265625e-06,
+  "data": {
+    "trace_id": "trace_20251121_163919_3caceecd",
+    "config": {
+      "video": false,
+      "screenshots": true,
+      "api_calls": true,
+      "accessibility_tree": false,
+      "metadata": true,
+      "name": null,
+      "path": null
+    },
+    "timestamp": 1763743159.1776536,
+    "computer_info": {
+      "os_type": "macos",
+      "provider_type": "lume",
+      "image": "test-image"
+    }
+  }
+}

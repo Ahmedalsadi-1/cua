@@ -1,0 +1,11 @@
+{
+  "type": "trace_end",
+  "timestamp": 1763743046.0664768,
+  "relative_time": 0.0004723072052001953,
+  "data": {
+    "timestamp": 1763743046.0664752,
+    "duration": 0.00047087669372558594,
+    "total_events": 1,
+    "screenshot_count": 1
+  }
+}
