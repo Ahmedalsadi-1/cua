@@ -1,0 +1,286 @@
+---
+title: Frontend Integration & Live Feedback
+description: Connect the Cua frontend to agent, VM, and computer servers with real-time telemetry and onboarding.
+---
+
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+import { Tabs, Tab } from 'fumadocs-ui/components/tabs';
+import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
+import { Lightbulb } from 'lucide-react';
+
+## Goals
+
+- Wire the **Next.js/React** UI to Lumier/Lume providers, the Computer Server, and the MCP server.
+- Stream **live logs, runtime output, and VM state** into dashboards so users see immediate feedback.
+- Provide onboarding helpers (tooltips, mascot, dark mode) and empty-state/error messaging instead of blank screens.
+- Validate multiple agents/VMs concurrently and surface their actions (clicks, typing, screenshots) in real time.
+
+## Architecture blueprint
+
+<Tabs items={["Local", "Cloud"]}>
+  <Tab value="Local">
+    Connect the browser to locally running services:
+
+    - Lumier/Lume provider on `localhost:3322`
+    - Computer Server on `localhost:3000`
+    - MCP Server on `localhost:3001`
+
+    Use **WebSockets** for frame/log streaming and **HTTP** for control actions.
+  </Tab>
+  <Tab value="Cloud">
+    Point the UI at the managed endpoints provided by your cloud sandbox. The same bindings work; swap hostnames/ports via environment variables.
+  </Tab>
+</Tabs>
+
+## Environment wiring
+
+Define shared variables for both the frontend and backend bridges so URLs are not hard-coded.
+
+```bash
+# apps/docs/.env.local (or your Next.js frontend)
+NEXT_PUBLIC_CUA_COMPUTER_WS=wss://localhost:3000/ws
+NEXT_PUBLIC_CUA_COMPUTER_HTTP=http://localhost:3000
+NEXT_PUBLIC_CUA_MCP_HTTP=http://localhost:3001
+NEXT_PUBLIC_LUMIER_HTTP=http://localhost:3322
+NEXT_PUBLIC_AGENT_MODEL=claude-3-7-sonnet-20250219
+NEXT_PUBLIC_MASCOT_ASSET="/assets/logo-white.svg"
+```
+
+Load them in `next.config.mjs` if you need server-side access:
+
+```js
+// next.config.mjs
+export default {
+  env: {
+    CUA_COMPUTER_HTTP: process.env.NEXT_PUBLIC_CUA_COMPUTER_HTTP,
+    CUA_MCP_HTTP: process.env.NEXT_PUBLIC_CUA_MCP_HTTP,
+    LUMIER_HTTP: process.env.NEXT_PUBLIC_LUMIER_HTTP,
+  },
+};
+```
+
+## API bindings (agent actions and telemetry)
+
+Create a lightweight client for agent actions and live feedback. The example below assumes the Computer Server exposes `/actions` for commands and `/events` for SSE/WebSocket streams.
+
+```ts
+// src/lib/cua-client.ts
+export type AgentEvent =
+  | { kind: 'status'; agentId: string; phase: string }
+  | { kind: 'log'; agentId: string; message: string; ts: number }
+  | { kind: 'frame'; agentId: string; screenshot: string; ts: number };
+
+const http = process.env.NEXT_PUBLIC_CUA_COMPUTER_HTTP!;
+
+export async function sendAction(agentId: string, action: string, payload: unknown) {
+  const res = await fetch(`${http}/actions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agentId, action, payload }),
+  });
+  if (!res.ok) throw new Error(`Action failed: ${await res.text()}`);
+  return res.json();
+}
+
+export function subscribeToEvents(onEvent: (event: AgentEvent) => void) {
+  const socket = new WebSocket(process.env.NEXT_PUBLIC_CUA_COMPUTER_WS!);
+  socket.onmessage = (msg) => {
+    const event = JSON.parse(msg.data) as AgentEvent;
+    onEvent(event);
+  };
+  socket.onerror = () => onEvent({ kind: 'log', agentId: 'system', message: 'Telemetry stream disconnected', ts: Date.now() });
+  return () => socket.close();
+}
+```
+
+## Live dashboard component
+
+The dashboard below renders **real-time logs, status chips, and screenshots** for one or many agents. It also handles error/empty states so the UI never shows a blank screen.
+
+```tsx
+// src/components/AgentDashboard.tsx
+'use client';
+
+import { useEffect, useMemo, useState } from 'react';
+import Image from 'next/image';
+import { subscribeToEvents, sendAction, AgentEvent } from '@/lib/cua-client';
+import { useTheme } from 'next-themes';
+
+export function AgentDashboard({ agents }: { agents: string[] }) {
+  const [events, setEvents] = useState<Record<string, AgentEvent[]>>({});
+  const { theme, setTheme } = useTheme();
+
+  useEffect(() => {
+    return subscribeToEvents((event) => {
+      setEvents((prev) => ({
+        ...prev,
+        [event.agentId]: [...(prev[event.agentId] ?? []), event].slice(-200),
+      }));
+    });
+  }, []);
+
+  const latestFrame = useMemo(() =>
+    Object.fromEntries(
+      Object.entries(events).map(([id, list]) => [
+        id,
+        [...list].reverse().find((e) => e.kind === 'frame') as AgentEvent | undefined,
+      ])
+    ),
+  [events]);
+
+  if (!agents.length) {
+    return <div className="rounded-lg border p-4 text-muted-foreground">No agents configured yet. Add an agent to start streaming events.</div>;
+  }
+
+  return (
+    <div className="space-y-6">
+      <header className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Image src={process.env.NEXT_PUBLIC_MASCOT_ASSET ?? '/assets/logo-black.svg'} width={36} height={36} alt="Cua mascot" />
+          <div>
+            <p className="text-sm text-muted-foreground">Live agent + VM feedback loop</p>
+            <p className="text-lg font-semibold">{agents.length} active agent(s)</p>
+          </div>
+        </div>
+        <button className="rounded-md border px-3 py-1 text-sm" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>
+          Toggle {theme === 'dark' ? 'light' : 'dark'} theme
+        </button>
+      </header>
+
+      <div className="grid gap-4 md:grid-cols-2">
+        {agents.map((id) => {
+          const agentEvents = events[id] ?? [];
+          const latestStatus = [...agentEvents].reverse().find((e) => e.kind === 'status');
+          const frame = latestFrame[id];
+
+          return (
+            <div key={id} className="rounded-lg border p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm text-muted-foreground">Agent</p>
+                  <p className="font-semibold">{id}</p>
+                </div>
+                <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200">
+                  {latestStatus?.phase ?? 'Idle'}
+                </span>
+              </div>
+
+              {frame && frame.kind === 'frame' ? (
+                <Image
+                  src={`data:image/png;base64,${frame.screenshot}`}
+                  width={640}
+                  height={360}
+                  alt={`Latest frame for ${id}`}
+                  className="w-full rounded-md border"
+                />
+              ) : (
+                <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
+                  Waiting for first screenshot or action...
+                </div>
+              )}
+
+              <div className="rounded-md border bg-muted/40 max-h-48 overflow-y-auto text-xs p-3 font-mono">
+                {agentEvents.length ? (
+                  agentEvents.map((event, idx) => (
+                    <div key={idx} className="py-0.5">
+                      <span className="text-muted-foreground mr-2">[{new Date(event.ts ?? Date.now()).toLocaleTimeString()}]</span>
+                      <span className="font-semibold">{event.kind.toUpperCase()}:</span> {('message' in event && event.message) || event.kind}
+                    </div>
+                  ))
+                ) : (
+                  <p className="text-muted-foreground">No events yet. Trigger an action to start streaming.</p>
+                )}
+              </div>
+
+              <div className="flex gap-2">
+                <button className="flex-1 rounded-md bg-primary text-primary-foreground px-3 py-2 text-sm" onClick={() => sendAction(id, 'screenshot', {})}>
+                  Capture screenshot
+                </button>
+                <button className="flex-1 rounded-md border px-3 py-2 text-sm" onClick={() => sendAction(id, 'type', { text: 'hello world' })}>
+                  Type "hello world"
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+```
+
+## Onboarding helpers and tooltips
+
+Add contextual guidance so new users know what to do next.
+
+```tsx
+// src/components/OnboardingHints.tsx
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from 'fumadocs-ui/components/tooltip';
+import { Lightbulb } from 'lucide-react';
+
+export function OnboardingHints() {
+  return (
+    <TooltipProvider>
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <Lightbulb size={16} />
+        <Tooltip>
+          <TooltipTrigger className="underline decoration-dotted">How do I start?</TooltipTrigger>
+          <TooltipContent className="max-w-xs">
+            1) Pick a sandbox from the VM selector. 2) Hit "Connect" to subscribe to telemetry. 3) Run a sample workflow to see screenshots and logs instantly.
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    </TooltipProvider>
+  );
+}
+```
+
+Place `OnboardingHints` under the dashboard header to keep guidance visible.
+
+## Sample workflows (UI to backend)
+
+Use the following quick actions to mirror the demo video flow and surface immediate feedback in the dashboard:
+
+<Steps>
+  <Step title="Open app">
+    Invoke `sendAction(agentId, 'open', { app: 'browser', url: 'https://example.com' })`. The UI will show a `status` event (phase: `opening`) followed by frames as the page loads.
+  </Step>
+  <Step title="Take screenshot">
+    Click **Capture screenshot** in the dashboard. The latest frame renders inline and replaces the empty state.
+  </Step>
+  <Step title="Analyze interface">
+    Send `sendAction(agentId, 'analyze', { prompt: 'Summarize visible UI' })` and render returned log messages in the stream. Show a spinner only while waiting; fall back to the error banner if the call fails.
+  </Step>
+</Steps>
+
+## Error, loading, and offline handling
+
+- Replace spinners with **status banners** when telemetry is disconnected (`Telemetry stream disconnected`).
+- Use empty-state cards (`No agents configured yet`) before connections are established.
+- Surface backend issues inline: if `sendAction` throws, push a `log` event with the error message so users see the failure instead of a silent stall.
+
+## Multi-agent / multi-VM stress test
+
+<Accordions type="single" collapsible>
+  <Accordion title="1. Launch and subscribe">
+    Start 3–5 sandboxes, then render `<AgentDashboard agents={['vm-a', 'vm-b', 'vm-c']}/>` to open concurrent WebSocket subscriptions.
+  </Accordion>
+  <Accordion title="2. Trigger concurrent actions">
+    Fire parallel actions (e.g., screenshot + type) across agents. The log stream should alternate between agent IDs; frame cards update independently without blocking the UI thread.
+  </Accordion>
+  <Accordion title="3. Measure responsiveness">
+    Confirm status chips flip within 1–2 seconds of backend responses. If not, log the latency and retry the subscription or restart the Computer Server.
+  </Accordion>
+  <Accordion title="4. Teardown">
+    After testing, call `sendAction(agentId, 'shutdown', {})` for each VM and verify the UI shows a final `status` of `stopped` and clears the stream.
+  </Accordion>
+</Accordions>
+
+## Deployment checklist
+
+- Verify ports 3000 (Computer Server), 3001 (MCP), and 3322 (Lumier/Lume) are reachable from the browser.
+- Confirm dark mode defaults via `next-themes` and that the mascot asset renders on both themes.
+- Enable gzip/edge caching for log endpoints only if it does not delay delivery; otherwise keep them uncached for instant updates.
+- Add a `/healthz` ping in your hosting platform to catch backend outages before users see blank dashboards.
+
+With these bindings and components, the frontend stays synchronized with backend agent actions: every click, keystroke, and screenshot shows up instantly with clear status, onboarding hints, and resilient error handling.

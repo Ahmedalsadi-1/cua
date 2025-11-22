@@ -1,0 +1,308 @@
+---
+title: VM Orchestration Runbook
+description: End-to-end script and workflow for booting Cua sandboxes/VMs and running a hello-world automation.
+---
+
+import { Tabs, Tab } from 'fumadocs-ui/components/tabs';
+
+## Overview
+
+This runbook provides a reproducible sequence to prepare a fresh host, install all Cua SDKs and VM tooling, configure environment variables, and run a "hello world" automation that connects to a sandbox and takes a screenshot. Commands are written for bash-compatible shells and include inline comments so logs capture each action.
+
+## Requirements snapshot
+
+- Python 3.12 (see `requires-python` in `pyproject.toml`) and `python3.12-venv`/`pip` available.
+- Docker Engine or Docker Desktop with permission to run containers (required for Linux-on-Docker and Lumier).
+- Node.js 18+ (for docs/site builds) and pnpm 9+/npm for optional JS tooling.
+- Git, curl, unzip, and build tooling (`build-essential`, `pkg-config`, `libffi-dev`, `libssl-dev`) for native Python wheels.
+- macOS users: Lume CLI; Linux/Windows users: Lumier Docker images or Windows Sandbox features.
+
+## Clean start and base packages
+
+Use this script to reset caches, update the OS, and install host prerequisites. Adjust package manager commands for non-Debian systems.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 0) Log start time and OS info
+start_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+echo "[cua-setup] Starting run at ${start_ts}" | tee setup.log
+uname -a | tee -a setup.log
+
+# 1) Remove stale caches/temp files (Python, Node, Cua traces)
+rm -rf ~/.cache/pip ~/.cache/uv ~/.cache/huggingface ~/.npm ~/.pnpm-store ~/.cache/cua || true
+rm -rf .venv .pytest_cache .ruff_cache traces/* || true
+
+# 2) Refresh package index and upgrade core system packages
+sudo apt-get update -y | tee -a setup.log
+sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y | tee -a setup.log
+
+# 3) Install base build + runtime deps
+sudo apt-get install -y git curl unzip build-essential pkg-config libffi-dev libssl-dev \
+  python3.12 python3.12-venv python3.12-dev python3-pip docker.io docker-compose \
+  jq net-tools | tee -a setup.log
+
+# 4) Verify Docker permissions
+sudo usermod -aG docker "$USER" || true
+if ! groups "$USER" | grep -q docker; then
+  echo "[cua-setup] Re-login required for docker group; continuing with sudo docker" | tee -a setup.log
+fi
+
+# 5) Node tooling (optional; skip if already installed)
+if ! command -v node >/dev/null; then
+  curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+  sudo apt-get install -y nodejs | tee -a setup.log
+fi
+npm install -g pnpm@9 | tee -a setup.log
+```
+
+## Python environment and Cua SDK installs
+
+Create an isolated environment and install all Python packages used by the agent, computer, server, and MCP components.
+
+```bash
+# 6) Create venv and activate
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip uv wheel setuptools
+
+# 7) Install Cua SDKs (from PyPI) with extras for agent + tools
+pip install "cua-agent[all]" "cua-computer" "cua-computer-server" "cua-mcp-server" "cua-som" "hud-python[agent]"
+
+# 8) Optional: install from local source instead of PyPI
+# uv pip install -e libs/python/agent -e libs/python/computer -e libs/python/computer-server \
+#   -e libs/python/mcp-server -e libs/python/som -e libs/python/core
+```
+
+## VM tooling: Lume (macOS) and Lumier (Docker-based)
+
+<Tabs items={['macOS (Lume)', 'Linux/Windows (Lumier)']}>
+  <Tab value="macOS (Lume)">
+
+  ```bash
+  # 9) Install/update Lume CLI for macOS sandbox control
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/lume/scripts/install.sh)"
+
+  # 10) Launch the default macOS Sequoia image
+  lume run macos-sequoia-cua:latest
+  ```
+
+  </Tab>
+  <Tab value="Linux/Windows (Lumier)">
+
+  ```bash
+  # 9) Pull lightweight + full-desktop Docker images
+  docker pull --platform=linux/amd64 trycua/cua-xfce:latest
+  docker pull --platform=linux/amd64 trycua/cua-ubuntu:latest
+
+  # 10) Start a local XFCE sandbox with GPU disabled by default
+  docker run -d --name cua-xfce -p 3000:3000 -p 6080:6080 --shm-size=2g \
+    -e CUA_ENABLE_VNC=true trycua/cua-xfce:latest
+  ```
+
+  </Tab>
+</Tabs>
+
+## Environment variables
+
+Create a `.env` file in the repo root so both Python examples and the MCP server can load credentials consistently.
+
+```bash
+cat <<'ENV' > .env
+CUA_API_KEY=sk_cua-api01_...
+CUA_MODEL=anthropic/claude-3.7-sonnet
+CUA_COMPUTER_OS=linux    # or windows / macos
+CUA_COMPUTER_PROVIDER=cloud  # cloud | docker | macos | windows
+CUA_COMPUTER_NAME=your-sandbox-name
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_API_KEY=...
+CUA_WS_ENDPOINT=ws://localhost:3000  # for local Docker/Lume
+ENV
+
+# Load it for the current shell
+set -a && source .env && set +a
+```
+
+## Connectivity checks
+
+```bash
+# 11) Confirm ports and Docker containers
+sudo netstat -tulpn | grep -E "3000|6080" | tee -a setup.log
+sudo docker ps | tee -a setup.log
+
+# 12) Validate Cua cloud CLI auth (if using cloud sandboxes)
+curl -s https://api.cua.ai/v1/health || true
+```
+
+## Backend services and VM provider automation
+
+Use the following workflow to start and validate the three core services—VM provider (Lume/Lumier), computer server, and MCP server—using default ports and shared logging.
+
+```bash
+# 14) Define defaults and log sink
+LOG_DIR=${LOG_DIR:-logs}
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/backend-stack.log"
+
+COMPUTER_PORT=${COMPUTER_PORT:-3000}
+COMPUTER_SERVER_PORT=${COMPUTER_SERVER_PORT:-3002}
+MCP_PORT=${MCP_PORT:-3001}
+
+echo "[cua-backend] starting services" | tee -a "$LOG_FILE"
+
+# 15) Start Lumier (Docker) VM provider with minimal resources; stop/recreate if needed
+docker rm -f cua-xfce || true
+docker run -d --name cua-xfce \
+  -p ${COMPUTER_PORT}:3000 -p 6080:6080 --shm-size=2g \
+  -e CUA_ENABLE_VNC=true -e CUA_API_KEY="$CUA_API_KEY" \
+  --cpus=2 --memory=4g trycua/cua-xfce:latest | tee -a "$LOG_FILE"
+
+# 16) Launch computer server (WebSocket bridge to the VM)
+cat > computer-server.config.json <<JSON
+{
+  "host": "0.0.0.0",
+  "port": ${COMPUTER_SERVER_PORT},
+  "sandbox": {
+    "endpoint": "ws://localhost:${COMPUTER_PORT}",
+    "provider": "docker",
+    "name": "cua-xfce"
+  },
+  "auth": {
+    "apiKey": "${CUA_API_KEY}"
+  }
+}
+JSON
+
+python -m computer_server --config computer-server.config.json \
+  2>&1 | tee -a "$LOG_FILE" &
+
+# 17) Launch MCP server pointing to the same computer server
+cat > mcp.config.json <<JSON
+{
+  "computer": {
+    "endpoint": "ws://localhost:${COMPUTER_SERVER_PORT}",
+    "api_key": "${CUA_API_KEY}"
+  },
+  "listen": {
+    "host": "0.0.0.0",
+    "port": ${MCP_PORT}
+  }
+}
+JSON
+
+python -m cua_mcp_server --config mcp.config.json \
+  2>&1 | tee -a "$LOG_FILE" &
+
+# 18) Health checks for all services
+docker ps --filter "name=cua-xfce" | tee -a "$LOG_FILE"
+curl -s "http://localhost:${COMPUTER_PORT}/health" | tee -a "$LOG_FILE" || true
+curl -s "http://localhost:${COMPUTER_SERVER_PORT}/health" | tee -a "$LOG_FILE" || true
+curl -s "http://localhost:${MCP_PORT}/health" | tee -a "$LOG_FILE" || true
+```
+
+### Sample VM lifecycle (start/stop/teardown)
+
+```bash
+# Start or restart the stack
+bash scripts/start_cua_stack.sh  # optional wrapper around steps 14-18
+
+# Reboot the VM container to validate lifecycle
+docker restart cua-xfce | tee -a "$LOG_FILE"
+
+# Tear down everything
+docker rm -f cua-xfce | tee -a "$LOG_FILE"
+pkill -f computer_server || true
+pkill -f cua_mcp_server || true
+```
+
+### Basic interaction and telemetry capture
+
+Use the `cua-computer` SDK to validate input events and capture logs to a dashboard file.
+
+```python
+# scripts/stack_validation.py
+import asyncio
+import json
+import os
+from pathlib import Path
+from computer import Computer
+
+TELEMETRY = Path(os.environ.get("LOG_DIR", "logs")) / "telemetry.jsonl"
+
+computer = Computer(
+    os_type="linux",
+    provider_type="docker",
+    name="cua-xfce",
+    endpoint=os.environ.get("CUA_WS_ENDPOINT", "ws://localhost:3000"),
+)
+
+async def main():
+    await computer.run()
+    await computer.click(200, 200)
+    await computer.type("hello from cua\n")
+    screenshot = await computer.take_screenshot()
+    payload = {"event": "validation", "screenshot": screenshot}
+    TELEMETRY.parent.mkdir(parents=True, exist_ok=True)
+    with TELEMETRY.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload) + "\n")
+    await computer.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run it and confirm telemetry:
+
+```bash
+python scripts/stack_validation.py 2>&1 | tee -a "$LOG_FILE"
+cat "$LOG_DIR/telemetry.jsonl"
+```
+
+These steps mirror the VM demo flow—provisioning, health checks, interaction (click/type/screenshot), telemetry capture, and lifecycle teardown—so any developer can repeat the setup locally or in CI.
+
+## Hello world automation (screenshot)
+
+Save the following script as `scripts/hello_world_screenshot.py` to launch/connect to a computer, take a screenshot, and log outputs. The script uses the `.env` values above.
+
+```python
+import asyncio
+import os
+from computer import Computer
+
+CUA_API_KEY = os.environ["CUA_API_KEY"]
+COMPUTER = Computer(
+    os_type=os.environ.get("CUA_COMPUTER_OS", "linux"),
+    provider_type=os.environ.get("CUA_COMPUTER_PROVIDER", "cloud"),
+    name=os.environ.get("CUA_COMPUTER_NAME", "cua-demo"),
+)
+
+async def main():
+    print("[hello-world] connecting to computer...")
+    await COMPUTER.run()
+    path = await COMPUTER.take_screenshot()
+    print(f"[hello-world] screenshot saved at: {path}")
+    await COMPUTER.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run it and capture logs:
+
+```bash
+# 13) Execute hello world and stream logs
+source .venv/bin/activate
+set -o pipefail
+python scripts/hello_world_screenshot.py 2>&1 | tee hello_world.log
+```
+
+## Troubleshooting checklist
+
+- If Docker ports are blocked, change the `-p` mappings and update `CUA_WS_ENDPOINT` accordingly.
+- If the agent fails to authenticate, regenerate the API key at https://cua.ai/dashboard and update `.env`.
+- For Windows Sandbox setups, ensure the `pywinsandbox` dependency is installed and Windows Sandbox is enabled in Windows Features.
+- If `take_screenshot` returns empty paths in Docker, ensure the container includes VNC (`CUA_ENABLE_VNC=true`) and has write permissions to the working directory.
+
+With the steps above, the repo can be booted from a clean machine, dependencies installed, ports verified, and a baseline automation executed with full logging for reproducibility.
