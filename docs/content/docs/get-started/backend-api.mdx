@@ -1,0 +1,133 @@
+---
+title: "Backend API for VM control"
+---
+
+This backend blueprint wires the VM control panel to real computer/agent actions. It exposes REST and WebSocket interfaces for
+start/stop/snapshot/command/log retrieval, secures them with bearer tokens, and routes events through the Cua Computer + Agent
+SDKs plus Lumier/Lume/Docker providers.
+
+## Architecture
+
+- **FastAPI service** with CORS enabled for the control panel origin.
+- **Token auth** via `Authorization: Bearer <CUA_CONTROL_TOKEN>` env var.
+- **VM registry** keeps transient status, last snapshot, and recent log lines for telemetry streaming.
+- **Cua integrations**: `computer.Computer` provisions Lumier/Lume/Docker providers, `agent.ComputerAgent` runs actions.
+- **WebSocket `/ws/telemetry`** broadcasts state, logs, snapshots, and agent chunks to the UI.
+
+## Run it locally
+
+```bash
+# Install backend deps
+pip install "fastapi[all]" pydantic
+
+# Export secrets and start the sample backend
+export CUA_CONTROL_TOKEN=devtoken
+export CUA_API_KEY=$YOUR_PROVIDER_KEY
+uvicorn examples.backend.cua_backend:app --port 8001 --reload
+```
+
+The control panel should call `http://localhost:8001` with the bearer token. WebSocket events stream to
+`ws://localhost:8001/ws/telemetry`.
+
+## API surface and contracts
+
+| Endpoint | Method | Body | Success response | Notes |
+| --- | --- | --- | --- | --- |
+| `/api/v1/vms` | POST | `VmSpec {id,name,os_type,provider,display,memory,cpu,model}` | `{status:"starting", vm: VmState}` | Starts VM + agent warmup |
+| `/api/v1/vms/{id}/stop` | POST | none | `{status:"stopped"}` | Marks VM idle and emits state update |
+| `/api/v1/vms/{id}/snapshot` | POST | none | `{status:"capturing"}` | Async capture; snapshot event via WS |
+| `/api/v1/vms/{id}/command` | POST | `{command:string}` | `{status:"queued"}` | Agent executes command, streams chunks |
+| `/api/v1/vms` | GET | none | `{items: VmState[]}` | Lists registry items |
+| `/api/v1/vms/{id}/logs` | GET | none | `{logs: VmLogLine[]}` | Pull log history |
+| `/ws/telemetry` | WS | none | JSON events `{type: state|log|snapshot|agent,...}` | Live updates for UI widgets |
+
+### Error handling
+
+- **401** when token missing/incorrect; keep the panel in a locked state.
+- **404** for unknown VM IDs; surface a toast like “VM not found or expired”.
+- **409** when a busy VM receives a duplicate start; show a subtle warning banner.
+- **500** when the backend is missing env keys; block UI actions and prompt for setup.
+- All async tasks publish `type: state` or `type: log` messages so the UI can render failed/offline states.
+
+## Sample backend implementation
+
+```python title="examples/backend/cua_backend.py"
+app = FastAPI(title="Cua VM Backend", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+security = HTTPBearer(auto_error=False)
+
+async def require_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> str:
+    token = os.environ.get("CUA_CONTROL_TOKEN")
+    if not token:
+        raise HTTPException(status_code=500, detail="Server missing CUA_CONTROL_TOKEN")
+    if credentials is None or credentials.scheme.lower() != "bearer" or credentials.credentials != token:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return token
+
+
+@app.post("/api/v1/vms", dependencies=[Depends(require_token)])
+async def start_vm(spec: VmSpec) -> dict[str, Any]:
+    state = registry.upsert(spec)
+    state.busy, state.status = True, "launching"
+    await _log(spec.id, "info", "Starting VM")
+
+    async def _launch() -> None:
+        try:
+            computer = await _ensure_computer(state)
+            agent = await _ensure_agent(computer, spec)
+            state.status = "running"
+            async for chunk in agent.run([{"role": "user", "content": "Take a screenshot and describe the desktop"}]):
+                state.last_result = str(chunk)
+                await registry.broadcast({"type": "agent", "vm_id": spec.id, "chunk": chunk})
+            await computer.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            state.status = "error"
+            await _log(spec.id, "error", f"Launch failed: {exc}")
+        finally:
+            state.busy = False
+            await registry.broadcast({"type": "state", "vm_id": spec.id, "status": state.status})
+
+    asyncio.create_task(_launch())
+    return {"status": "starting", "vm": state.model_dump()}
+
+
+@app.websocket("/ws/telemetry")
+async def telemetry_socket(ws: WebSocket) -> None:
+    await registry.attach(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        return
+```
+
+### Event envelope examples
+
+```json
+{"type":"state","vm_id":"vm-1","status":"running"}
+{"type":"snapshot","vm_id":"vm-1","url":"data:image/png;base64,..."}
+{"type":"log","vm_id":"vm-1","level":"error","message":"Snapshot failed: ..."}
+{"type":"agent","vm_id":"vm-1","chunk":{"output":[{"type":"message","content":[{"type":"text","text":"..."}]}]}}
+```
+
+## Agent workflows the panel can trigger
+
+1. **Open a browser + screenshot**: POST `/api/v1/vms` with `command:"open a browser and screenshot the homepage"` using
+   the command endpoint after start; listen for `type: snapshot`.
+2. **Click + type smoke test**: send `command:"click 200 300 then type hello world"` and verify agent chunks/logs.
+3. **Lifecycle loop**: start ➜ watch WS `state: running` ➜ `snapshot` ➜ `command` ➜ `stop`; confirm logs and state events
+   reflect each transition.
+
+## Resilience + observability notes
+
+- Enable Pydantic validation errors in logs for malformed requests so the UI can surface field-level hints.
+- Wrap provider launches with retry/backoff in the `_ensure_computer` helper; emit `type: state` updates for each retry.
+- Stream concise log lines (ts, level, message) to keep dashboard widgets light; keep full traces in file/STDOUT for ops.
+- Collect Telemetry and agent chunk summaries into a single dashboard file if desired (see `VmRegistry.logs`).
