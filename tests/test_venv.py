@@ -42,7 +42,7 @@ async def computer():
         os_type="linux",
         api_key=os.getenv("CUA_API_KEY"),
         name=str(os.getenv("CUA_CONTAINER_NAME")),
-        provider_type=VMProviderType.CLOUD,
+        provider_type=VMProviderType.DOCKER,
     )
 
     # # Create a local macOS computer with Cua

@@ -1,0 +1,53 @@
+{
+  "trace_id": "trace_20251121_164610_10b10fbe",
+  "config": {
+    "video": false,
+    "screenshots": true,
+    "api_calls": true,
+    "accessibility_tree": false,
+    "metadata": true,
+    "name": null,
+    "path": null
+  },
+  "start_time": 1763743570.9455118,
+  "end_time": 1763743570.9462152,
+  "duration": 0.0007035732269287109,
+  "total_events": 2,
+  "screenshot_count": 2,
+  "events": [
+    {
+      "type": "trace_start",
+      "timestamp": 1763743570.9455152,
+      "relative_time": 3.814697265625e-06,
+      "data": {
+        "trace_id": "trace_20251121_164610_10b10fbe",
+        "config": {
+          "video": false,
+          "screenshots": true,
+          "api_calls": true,
+          "accessibility_tree": false,
+          "metadata": true,
+          "name": null,
+          "path": null
+        },
+        "timestamp": 1763743570.9455118,
+        "computer_info": {
+          "os_type": "macos",
+          "provider_type": "lume",
+          "image": "test-image"
+        }
+      }
+    },
+    {
+      "type": "trace_end",
+      "timestamp": 1763743570.9459205,
+      "relative_time": 0.0004086494445800781,
+      "data": {
+        "timestamp": 1763743570.945919,
+        "duration": 0.0004074573516845703,
+        "total_events": 1,
+        "screenshot_count": 1
+      }
+    }
+  ]
+}
