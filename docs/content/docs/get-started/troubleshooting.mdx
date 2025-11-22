@@ -1,0 +1,229 @@
+---
+title: Troubleshooting & Optimization Guide
+description: Step-by-step diagnostics, log collectors, and hardening tips to keep Cua agents, sandboxes, and servers healthy.
+---
+
+import { Tabs, Tab } from 'fumadocs-ui/components/tabs';
+
+## Purpose and scope
+
+Use this guide when the stack diverges from the demo experience: blank screens, missing agent output, failing VM provisioning, or port/resource conflicts. Each section gives a reproducible script plus the exact files/ports to inspect so you can triage quickly and produce a support bundle.
+
+## Quick triage checklist
+
+1) Confirm services are listening (defaults):
+
+```bash
+# Computer Server (WS/WebRTC): 3000, MCP Server: 4000, Lumier VNC/noVNC: 6080/5900, Frontend/dev server: 5173 or 3000
+sudo lsof -i -P -n | grep -E "(3000|4000|5900|6080|5173)" || true
+```
+
+2) Verify .env completeness and load order:
+
+```bash
+set -a
+source .env 2>/dev/null || echo "No .env loaded; using shell vars"
+python - <<'PY'
+import os, sys
+required = [
+    "CUA_API_KEY", "CUA_MODEL", "CUA_COMPUTER_OS", "CUA_COMPUTER_PROVIDER",
+    "CUA_COMPUTER_NAME", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
+]
+missing = [k for k in required if not os.environ.get(k)]
+if missing:
+    sys.exit(f"Missing env vars: {', '.join(missing)}")
+print("Environment looks good")
+PY
+```
+
+3) Check GPU/memory headroom before booting a VM:
+
+```bash
+free -h
+nvidia-smi || echo "No NVIDIA GPU detected"
+df -h
+```
+
+## Log collectors for every service
+
+Use the following scripts to centralize logs into `troubleshooting/`.
+
+```bash
+mkdir -p troubleshooting
+
+# Computer Server logs (systemd or foreground)
+if systemctl list-units --type=service | grep -q computer-server; then
+  journalctl -u computer-server --since "-30m" > troubleshooting/computer-server.log
+else
+  ps -ef | grep -E "computer-server" | grep -v grep
+  lsof -i :3000 -sTCP:LISTEN -nP > troubleshooting/computer-server-ports.txt || true
+fi
+
+# MCP Server logs
+if systemctl list-units --type=service | grep -q mcp-server; then
+  journalctl -u mcp-server --since "-30m" > troubleshooting/mcp-server.log
+else
+  lsof -i :4000 -sTCP:LISTEN -nP > troubleshooting/mcp-server-ports.txt || true
+fi
+
+# Lumier/Lume provider logs (Docker or CLI)
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}' > troubleshooting/docker-containers.txt || true
+docker logs --tail=300 cua-xfce > troubleshooting/lumier.log 2>&1 || true
+
+# Frontend dev/build logs (if running via npm run dev)
+ps -ef | grep -E "(npm run dev|next|vite)" | grep -v grep > troubleshooting/frontend-procs.txt || true
+```
+
+## Diagnosing blank screens or missing agent output
+
+1. **Frontend check**: Open browser devtools and verify WebSocket requests to the computer server are 200/101 (no CORS errors). Look at `network` tab for `/ws` or `/socket` failures.
+2. **Backend check**: Tail computer server logs for screenshot or WebRTC errors:
+
+```bash
+tail -n 100 troubleshooting/computer-server.log || journalctl -u computer-server -n 100
+```
+
+3. **VM event records**: For Lumier containers, confirm VNC is publishing video frames and noVNC is reachable:
+
+```bash
+docker exec cua-xfce bash -lc 'supervisorctl status' || true
+docker exec cua-xfce bash -lc 'ls -l /var/log/supervisor/' || true
+```
+
+4. **Agent output**: If the agent stream is empty, ensure models are reachable and keys valid:
+
+```bash
+python - <<'PY'
+from cua_agent import ComputerAgent
+from cua_computer import Computer
+
+# Minimal smoke test: request a noop observation
+agent = ComputerAgent(Computer(os=os.environ.get("CUA_COMPUTER_OS", "linux")))
+for event in agent.run("Say hello", stream=True):
+    print(event)
+    break
+PY
+```
+
+## Port conflicts and isolation tips
+
+<Tabs items={['Linux/Docker', 'macOS (Lume)']}>
+  <Tab value="Linux/Docker">
+
+  - Stop old containers before starting a new sandbox:
+
+    ```bash
+    docker stop cua-xfce || true
+    docker rm cua-xfce || true
+    docker run -d --name cua-xfce -p 3000:3000 -p 6080:6080 --shm-size=2g \
+      -e CUA_ENABLE_VNC=true trycua/cua-xfce:latest
+    ```
+
+  - If ports are busy, remap them and propagate to the frontend `.env.local` and MCP server config:
+
+    ```bash
+    docker run -d --name cua-xfce -p 3300:3000 -p 6180:6080 trycua/cua-xfce:latest
+    export CUA_COMPUTER_SERVER_URL=http://localhost:3300
+    ```
+
+  </Tab>
+  <Tab value="macOS (Lume)">
+
+  - Restart the Lume daemon and clear cached VM state:
+
+    ```bash
+    lume stop all || true
+    lume clean
+    lume run macos-sequoia-cua:latest --port 3000
+    ```
+
+  - If display is blank, toggle hardware acceleration:
+
+    ```bash
+    lume settings set display.hardware_acceleration false
+    ```
+
+  </Tab>
+</Tabs>
+
+## Resource tuning and VM health checks
+
+- Right-size sandbox memory/CPU when automation stutters:
+
+```bash
+docker update --memory=4g --cpus=4 cua-xfce
+```
+
+- Confirm WebRTC/VNC is emitting frames by sampling a screenshot via `cua-computer`:
+
+```bash
+python - <<'PY'
+from cua_computer import Computer
+c = Computer()
+img = c.screenshot()
+img.save('troubleshooting/latest.png')
+print('Saved troubleshooting/latest.png')
+PY
+```
+
+- Validate MCP server health and schema negotiation:
+
+```bash
+curl -v http://localhost:4000/health || true
+curl -s http://localhost:4000/.well-known/ai-plugin.json | head -n 20 || true
+```
+
+## Status widgets and dashboards
+
+Expose quick health tiles in your frontend/dashboard:
+
+- **Ports**: Render `netstat`/`lsof` summaries for 3000/4000/6080.
+- **VM uptime**: Poll `docker inspect -f '{{.State.Status}}' cua-xfce` or `lume ps` every 10s.
+- **Agent stream**: Display the last SSE/WS message body; if stale for >20s, mark red and show reconnection CTA.
+- **GPU/memory**: Surface `nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader` and `free -h` outputs.
+
+## Common pitfalls and quick fixes
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Blank screen in browser | VNC/WebRTC blocked or container not publishing frames | Ensure `CUA_ENABLE_VNC=true`, ports 6080/5900 exposed, and verify `supervisorctl status` inside the container |
+| Agent returns empty output | Missing API keys or model not provisioned | Re-check `.env`, run the smoke test above, and try a smaller model like `anthropic/claude-3-haiku` |
+| MCP server connection refused | Service not started or port remapped | Start with `cua-mcp-server --port 4000` or update client to new port |
+| Screenshot/save fails | Missing write permission or disk full | Use `df -h`, free space, and ensure working directory is writable |
+| Port already in use | Old container/process running | `lsof -i :3000` then `docker stop` or kill the PID; remap ports if needed |
+
+## Support bundle (one-command collector)
+
+```bash
+bash -lc '
+mkdir -p troubleshooting/bundle && cd troubleshooting
+cp ../.env bundle/env.sample 2>/dev/null || true
+uname -a > bundle/system.txt
+free -h > bundle/memory.txt
+lsof -i -P -n | grep -E "(3000|4000|5900|6080)" > bundle/ports.txt || true
+journalctl -u computer-server -n 300 > bundle/computer-server.log 2>/dev/null || true
+journalctl -u mcp-server -n 300 > bundle/mcp-server.log 2>/dev/null || true
+docker logs cua-xfce --tail=400 > bundle/lumier.log 2>/dev/null || true
+tar czf support-bundle.tar.gz bundle
+'
+```
+
+Share `support-bundle.tar.gz` with your support channel. For secure uploads, use your organization's pre-approved storage or email gateway.
+
+## Optimization tips
+
+- Prefer lighter VM images (e.g., XFCE) for CI to reduce boot time and memory use.
+- Use `--shm-size=2g` or higher for browsers to avoid Chromium crashes when running vision tasks.
+- Keep `pip install cua-agent[all]` pinned to the version your agents expect; mismatched SDK/server versions can cause schema drift.
+- Rotate API keys and validate rate limits before long runs to avoid mid-session failures.
+- When iterating on UI, surface per-action timestamps so you can correlate agent logs with backend traces quickly.
+
+## When to escalate
+
+Escalate to the platform owner when:
+
+- Support bundle shows persistent WebRTC handshake failures across multiple hosts.
+- MCP server rejects schema negotiation after a clean reinstall.
+- Sandbox boot succeeds but video is consistently blank despite resource headroom and port checks.
+
+Provide the support bundle, a short repro script, and the last 50 lines of `traces/` from your run.
