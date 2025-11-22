@@ -1,0 +1,1072 @@
+---
+title: "VM control panel UI"
+---
+
+A modern, terminal-inspired control panel for desktop VM automation. It collapses into a dock, expands with smooth transitions,
+and surfaces live VM status, snapshots, and quick actions. The layout uses Tailwind utility classes plus a small CSS file to get
+the hybrid TUI/GUI look shown in the demo. This version also wires the panel directly to the Cua computer/VM API (REST +
+WebSocket) so every button triggers a real backend action and every event flows back as thumbnails, telemetry, and instant
+feedback toasts.
+
+Pair this UI with the token-protected backend described in [Backend API for VM control](./backend-api) so every button drives a
+real VM/agent action and receives live telemetry through REST + WebSocket events.
+
+## Features
+
+- **Collapsible/expandable shell** via toggle button or swipe gesture, with animated transitions.
+- **Hybrid TUI/GUI aesthetics**: dark theme, mono fonts, subtle scan-line gradients, and small iconography.
+- **Live state preview** showing connected VM instances, status pills, and snapshot preview tiles.
+- **Quick actions** for launch/stop/screenshot/send-command with command input and enter-to-send.
+- **Resource overlays** for CPU/memory/network plus last agent log line.
+- **Responsive grid** that adapts from a floating dock on phones to a multi-column panel on desktop.
+- **Mascot + themes**: a floating bunny/bot mascot animates in dock/expand transitions and a theme toggle cycles dark/carbon/plasma palettes.
+
+## Component code (React + Tailwind classes)
+
+The `ControlPanel` component accepts VM instances with live resources, busy state, snapshots, and log lines. Collapsing works
+with a toggle button or horizontal swipe (positive = collapse, negative = expand).
+
+```tsx title="examples/ui/vm-control-panel/ControlPanel.tsx"
+import React, { useMemo, useState } from 'react';
+import './control-panel.css';
+
+export type VmStatus = 'running' | 'idle' | 'error' | 'launching';
+
+export interface VmResource {
+  cpu: number;
+  memoryMb: number;
+  networkMbps?: number;
+}
+
+export interface VmInstance {
+  id: string;
+  name: string;
+  status: VmStatus;
+  snapshotUrl?: string;
+  lastCommand?: string;
+  lastResult?: string;
+  busyLabel?: string;
+  resource?: VmResource;
+  recentLogLine?: string;
+}
+
+type PanelTheme = 'dark' | 'carbon' | 'plasma';
+
+interface ControlPanelProps {
+  instances: VmInstance[];
+  onAction?: (id: string, action: 'launch' | 'stop' | 'screenshot' | 'send-command') => void;
+  onCommandText?: (id: string, text: string) => void;
+  defaultCollapsed?: boolean;
+}
+
+const statusTone: Record<VmStatus, string> = {
+  running: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/60',
+  idle: 'bg-slate-500/20 text-slate-200 border-slate-500/60',
+  error: 'bg-rose-500/20 text-rose-200 border-rose-500/60',
+  launching: 'bg-amber-500/20 text-amber-200 border-amber-500/60',
+};
+
+const statusLabel: Record<VmStatus, string> = {
+  running: 'Running',
+  idle: 'Idle',
+  error: 'Error',
+  launching: 'Launching',
+};
+
+export function ControlPanel({
+  instances,
+  onAction,
+  onCommandText,
+  defaultCollapsed = false,
+}: ControlPanelProps) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const [touchStartX, setTouchStartX] = useState<number | null>(null);
+  const [draftCommands, setDraftCommands] = useState<Record<string, string>>({});
+  const themes: PanelTheme[] = ['dark', 'carbon', 'plasma'];
+  const [themeIndex, setThemeIndex] = useState(0);
+  const theme = themes[themeIndex % themes.length];
+
+  const liveCounts = useMemo(
+    () => ({
+      running: instances.filter((vm) => vm.status === 'running').length,
+      idle: instances.filter((vm) => vm.status === 'idle').length,
+      error: instances.filter((vm) => vm.status === 'error').length,
+    }),
+    [instances]
+  );
+
+  const handleSwipe = (deltaX: number) => {
+    const threshold = 40; // adjust to taste
+    if (deltaX > threshold) setCollapsed(true);
+    if (deltaX < -threshold) setCollapsed(false);
+  };
+
+  return (
+    <div
+      className={`cua-panel ${collapsed ? 'collapsed' : 'expanded'}`}
+      data-theme={theme}
+      onTouchStart={(e) => setTouchStartX(e.touches[0].clientX)}
+      onTouchMove={(e) => touchStartX !== null && handleSwipe(e.touches[0].clientX - touchStartX)}
+      onTouchEnd={() => setTouchStartX(null)}
+    >
+      <div className="cua-panel__rails" aria-hidden />
+      <div className="cua-panel__rail-dot" aria-hidden />
+      <div className={`cua-mascot ${collapsed ? 'cua-mascot--hidden' : ''}`} aria-hidden>
+        <div className="cua-mascot__body">🐇</div>
+        <p className="cua-mascot__tag">Agent bunny online</p>
+      </div>
+
+      <header className="cua-panel__header">
+        <div>
+          <p className="text-xs uppercase tracking-[0.2em] text-cyan-300/70">VM control panel</p>
+          <h3 className="text-lg font-semibold text-slate-50">Desktop automation cockpit</h3>
+          <p className="text-sm text-slate-300/80">Hybrid TUI/GUI with live status + quick actions</p>
+        </div>
+        <div className="cua-panel__header-actions">
+          <button
+            type="button"
+            className="cua-toggle"
+            onClick={() => setThemeIndex((i) => i + 1)}
+            aria-label="Toggle panel theme"
+          >
+            Theme: {theme}
+          </button>
+          <button
+            type="button"
+            className="cua-toggle"
+            onClick={() => setCollapsed((v) => !v)}
+            aria-label={collapsed ? 'Expand panel' : 'Collapse panel'}
+          >
+            {collapsed ? '▣' : '☰'}
+          </button>
+        </div>
+      </header>
+
+      <div className="cua-panel__summary">
+        <div>
+          <span className="label">Running</span>
+          <strong>{liveCounts.running}</strong>
+        </div>
+        <div>
+          <span className="label">Idle</span>
+          <strong>{liveCounts.idle}</strong>
+        </div>
+        <div>
+          <span className="label">Errors</span>
+          <strong>{liveCounts.error}</strong>
+        </div>
+      </div>
+
+      <section className="cua-panel__instances">
+        {instances.map((vm) => (
+          <article key={vm.id} className="cua-card">
+            <div className="cua-card__header">
+              <div>
+                <p className="text-[11px] uppercase tracking-[0.2em] text-cyan-200/60">{vm.id}</p>
+                <h4 className="text-base text-slate-50 font-semibold">{vm.name}</h4>
+              </div>
+              <span className={`cua-pill ${statusTone[vm.status]}`}>
+                <span className="cua-pulse" aria-hidden />
+                {statusLabel[vm.status]}
+              </span>
+            </div>
+
+            <div className="cua-card__body">
+              <div className="cua-snapshot" aria-label={`Snapshot for ${vm.name}`}>
+                {vm.snapshotUrl ? (
+                  <img src={vm.snapshotUrl} alt={`VM ${vm.name} snapshot`} />
+                ) : (
+                  <div className="cua-snapshot__placeholder">
+                    <span className="text-cyan-200/80">No snapshot yet</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="cua-actions">
+                <button disabled={!!vm.busyLabel} onClick={() => onAction?.(vm.id, 'launch')}>
+                  {vm.busyLabel === 'launch' ? <span className="cua-spinner" aria-label="Launching" /> : 'Launch'}
+                </button>
+                <button disabled={!!vm.busyLabel} onClick={() => onAction?.(vm.id, 'stop')}>
+                  {vm.busyLabel === 'stop' ? <span className="cua-spinner" aria-label="Stopping" /> : 'Stop'}
+                </button>
+                <button disabled={!!vm.busyLabel} onClick={() => onAction?.(vm.id, 'screenshot')}>
+                  {vm.busyLabel === 'screenshot' ? (
+                    <span className="cua-spinner" aria-label="Capturing" />
+                  ) : (
+                    'Screenshot'
+                  )}
+                </button>
+                <button disabled={!!vm.busyLabel} onClick={() => onAction?.(vm.id, 'send-command')}>
+                  {vm.busyLabel === 'send-command' ? (
+                    <span className="cua-spinner" aria-label="Sending" />
+                  ) : (
+                    'Send command'
+                  )}
+                </button>
+              </div>
+
+              <label className="cua-command">
+                <span>Command</span>
+                <input
+                  type="text"
+                  value={draftCommands[vm.id] ?? vm.lastCommand ?? ''}
+                  onChange={(e) =>
+                    setDraftCommands((prev) => ({ ...prev, [vm.id]: e.target.value }))
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      const text = draftCommands[vm.id] ?? '';
+                      onCommandText?.(vm.id, text);
+                    }
+                  }}
+                  placeholder="type to send..."
+                />
+              </label>
+
+              {vm.resource && (
+                <div className="cua-metrics" aria-label={`Resource usage for ${vm.name}`}>
+                  <div>
+                    <span className="label">CPU</span>
+                    <strong>{vm.resource.cpu.toFixed(0)}%</strong>
+                  </div>
+                  <div>
+                    <span className="label">Memory</span>
+                    <strong>{vm.resource.memoryMb.toFixed(0)} MB</strong>
+                  </div>
+                  {vm.resource.networkMbps !== undefined && (
+                    <div>
+                      <span className="label">Network</span>
+                      <strong>{vm.resource.networkMbps.toFixed(1)} Mbps</strong>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {(vm.lastResult || vm.recentLogLine) && (
+                <div className="cua-logline" aria-live="polite">
+                  <span className="label">Last message</span>
+                  <p>{vm.lastResult ?? vm.recentLogLine}</p>
+                </div>
+              )}
+            </div>
+          </article>
+        ))}
+      </section>
+    </div>
+  );
+}
+
+export default ControlPanel;
+```
+
+## TUI-GUI hybrid visual identity
+
+- **Typography and widgets**: Mono-forward stack with bold weights on headers (`font-semibold`), dashed borders, and pill buttons to echo a terminal palette. Use compact uppercase labels, bordered cards, and fine dotted separators to keep the TUI cues.
+- **Animated depth**: The `cua-panel` surface layers a dashed inner stroke (`::after`) with glowing `pane-glow`/`line-sweep` animations for a scanner-like feel. Collapsing/expanding runs `ease-in-out` transforms on scale/opacity, while `cua-panel__rails` paints animated line highlights.
+- **Mascot motion**: `cua-mascot` floats a bunny/bot badge in and out as the panel docks/expands; the class auto-hides on collapse but keeps the glow in expanded mode. Swap the emoji with an SVG sprite if you prefer.
+- **Color + icons**: Default dark + cyan, `carbon` (teal/lavender), and `plasma` (blue/pink) themes are cycled via the header theme toggle. Icon packs that fit: Phosphor/Feather (outlined), Lucide (thin strokes), or Heroicons (rounded). Keep status pills and ghost buttons outlined to preserve contrast.
+- **Layouts / mockups**:
+  - **Desktop/fullscreen**: Keep the panel centered with a 2–3 column grid of cards and the toast shelf pinned bottom-right. Snapshot previews scale up to 240px height with resource badges overlaid.
+  - **Windowed**: Constrain max width to 1080px (default), anchor the panel to the bottom of your app frame, and leave the dock animation visible by keeping `max-height` small when collapsed.
+  - **Floating widget**: On mobile or sidebars, collapse by default; expose the toggle and mascot only, and reveal the grid on swipe-left/right. The rails + glow effects remain but are masked with `mask-image` to avoid overwhelming small canvases.
+- **Theme toggles**: The header theme button cycles the CSS variables (`data-theme`) so the same component can run in dark dashboards, light modals, or neon-style streaming layouts. Pair with a Tailwind `dark` class if you need page-level overrides.
+
+## Wire it to the Cua backend (REST + WebSocket)
+
+`ControlPanelApp` pairs the UI with live computer/VM controls: launch/stop, screenshot capture, keyboard input, log retrieval,
+and telemetry streaming. Swap the base/WS URLs for your Electron preload, Next.js API routes, or direct computer-server origin.
+
+```tsx title="examples/ui/vm-control-panel/ControlPanelApp.tsx"
+import React, { useEffect, useMemo, useState } from 'react';
+import ControlPanel, { VmInstance, VmResource } from './ControlPanel';
+import './control-panel.css';
+
+type Toast = { id: string; message: string; tone: 'success' | 'error' | 'info' };
+
+type VmUpdate = Partial<VmInstance> & { id: string };
+
+type Action = 'launch' | 'stop' | 'screenshot' | 'send-command';
+
+type ApiResponse<T> = { data?: T; message?: string };
+
+class CuaApiClient {
+  constructor(private readonly baseUrl: string, private readonly wsUrl: string) {}
+
+  private async post<T>(path: string, body?: Record<string, unknown>): Promise<ApiResponse<T>> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+
+    if (!res.ok) {
+      const message = await res.text();
+      throw new Error(message || `HTTP ${res.status}`);
+    }
+
+    const json = await res.json().catch(() => undefined);
+    return json ?? { message: 'ok' };
+  }
+
+  launchVm(id: string) {
+    return this.post(`/computer/v1/vms/${id}/launch`);
+  }
+
+  stopVm(id: string) {
+    return this.post(`/computer/v1/vms/${id}/stop`);
+  }
+
+  screenshot(id: string) {
+    return this.post<{ snapshotUrl: string }>(`/computer/v1/vms/${id}/screenshot`);
+  }
+
+  sendCommand(id: string, command: string) {
+    return this.post(`/computer/v1/vms/${id}/input`, { command });
+  }
+
+  fetchLogs(id: string) {
+    return this.post<{ logs: string[] }>(`/computer/v1/vms/${id}/logs`);
+  }
+
+  streamVmUpdates(onUpdate: (update: VmUpdate) => void) {
+    const ws = new WebSocket(`${this.wsUrl}/computer/v1/vms/stream`);
+    ws.onmessage = (event) => {
+      const payload = JSON.parse(event.data);
+      onUpdate(payload as VmUpdate);
+    };
+    return () => ws.close();
+  }
+}
+
+function mergeUpdate(prev: VmInstance[], update: VmUpdate): VmInstance[] {
+  const next = [...prev];
+  const index = next.findIndex((vm) => vm.id === update.id);
+  const merged: VmInstance = {
+    id: update.id,
+    name: update.name ?? `VM-${update.id}`,
+    status: update.status ?? 'idle',
+    snapshotUrl: update.snapshotUrl,
+    lastCommand: update.lastCommand,
+    lastResult: update.lastResult,
+    resource: update.resource as VmResource | undefined,
+    recentLogLine: update.recentLogLine,
+    busyLabel: update.busyLabel,
+  };
+
+  if (index >= 0) {
+    next[index] = { ...next[index], ...merged };
+  } else {
+    next.push(merged);
+  }
+  return next;
+}
+
+export function ControlPanelApp() {
+  const client = useMemo(() => new CuaApiClient('http://localhost:8000', 'ws://localhost:8000'), []);
+  const [instances, setInstances] = useState<VmInstance[]>([
+    { id: 'vm-01', name: 'Workspace', status: 'idle', resource: { cpu: 7, memoryMb: 512 } },
+    { id: 'vm-02', name: 'Browser sand-box', status: 'launching', resource: { cpu: 21, memoryMb: 1024 } },
+  ]);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [toasts, setToasts] = useState<Toast[]>([]);
+
+  useEffect(() => {
+    const stop = client.streamVmUpdates((update) => {
+      setInstances((prev) => mergeUpdate(prev, update));
+      if (update.lastResult) {
+        pushToast({ id: `${update.id}-result`, message: update.lastResult, tone: 'success' });
+      }
+    });
+    return stop;
+  }, [client]);
+
+  const pushToast = (toast: Toast) => {
+    setToasts((prev) => [...prev, toast]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== toast.id));
+    }, 3600);
+  };
+
+  const handleAction = async (id: string, action: Action, commandText?: string) => {
+    setInstances((prev) => prev.map((vm) => (vm.id === id ? { ...vm, busyLabel: action } : vm)));
+
+    try {
+      if (action === 'launch') await client.launchVm(id);
+      if (action === 'stop') await client.stopVm(id);
+      if (action === 'screenshot') {
+        const res = await client.screenshot(id);
+        if (res.data?.snapshotUrl) {
+          setInstances((prev) => prev.map((vm) => (vm.id === id ? { ...vm, snapshotUrl: res.data?.snapshotUrl } : vm)));
+          pushToast({ id: `${id}-screenshot`, message: 'Screenshot saved', tone: 'success' });
+        }
+      }
+      if (action === 'send-command') {
+        const text = commandText ?? drafts[id] ?? '';
+        await client.sendCommand(id, text);
+      }
+      pushToast({ id: `${id}-${action}`, message: `${action} requested`, tone: 'info' });
+    } catch (err) {
+      pushToast({ id: `${id}-${action}-error`, message: (err as Error).message, tone: 'error' });
+    } finally {
+      setInstances((prev) => prev.map((vm) => (vm.id === id ? { ...vm, busyLabel: undefined } : vm)));
+    }
+  };
+
+  const handleCommand = async (id: string, text: string) => {
+    setDrafts((prev) => ({ ...prev, [id]: text }));
+    if (!text) return;
+    await handleAction(id, 'send-command', text);
+  };
+
+  const handleInspectLogs = async (id: string) => {
+    try {
+      const res = await client.fetchLogs(id);
+      const tail = res.data?.logs?.slice(-1)?.[0];
+      if (tail) {
+        setInstances((prev) => prev.map((vm) => (vm.id === id ? { ...vm, recentLogLine: tail, lastResult: tail } : vm)));
+        pushToast({ id: `${id}-logs`, message: 'Agent log updated', tone: 'info' });
+      }
+    } catch (err) {
+      pushToast({ id: `${id}-logs-error`, message: (err as Error).message, tone: 'error' });
+    }
+  };
+
+  return (
+    <div className="cua-panel__layout">
+      <ControlPanel instances={instances} onAction={handleAction} onCommandText={handleCommand} />
+      <div className="cua-panel__actions-row">
+        {instances.map((vm) => (
+          <button key={vm.id} className="cua-ghost" onClick={() => handleInspectLogs(vm.id)}>
+            View agent logs · {vm.name}
+          </button>
+        ))}
+      </div>
+
+      <div className="cua-toast-shelf" aria-live="assertive">
+        {toasts.map((toast) => (
+          <div key={toast.id} className={`cua-toast cua-toast--${toast.tone}`}>
+            <span className="cua-pulse" aria-hidden />
+            {toast.message}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### Endpoint notes
+
+- REST defaults target the computer server (FastAPI) exposed by `python -m computer_server --log-level debug` on
+  `http://localhost:8000`. Adjust the base/WS URLs if you reverse-proxy behind Electron or Next.js.
+- `streamVmUpdates` listens for JSON payloads broadcast by the computer server. Shape your payload to include status, snapshot
+  URL, resources, and recent log lines to hydrate the panel in real time.
+- `sendCommand` accepts keyboard or mouse payloads—extend the body to `{ command: 'click', x: 440, y: 120 }` or
+  `{ command: 'type', text: 'hello' }` depending on your backend handlers.
+
+## Styling and animation
+
+The CSS file provides the dark terminal surface, glow accents, spinner/toast styles, and collapse/expand transitions. It can
+live next to the component or be merged into your design system. Tailwind utility classes drive layout, while the CSS supplies
+gradients, pulses, resource badges, and dock-like behavior.
+
+```css title="examples/ui/vm-control-panel/control-panel.css"
+:root {
+  --panel-bg: #0b1224;
+  --panel-border: #1c273a;
+  --panel-highlight: #3be2c4;
+  --panel-highlight-2: #9ae6b4;
+  --panel-gradient: radial-gradient(circle at 20% 20%, rgba(0, 255, 191, 0.08), transparent 35%),
+    radial-gradient(circle at 80% 0%, rgba(135, 206, 250, 0.1), transparent 25%),
+    linear-gradient(135deg, rgba(12, 19, 31, 0.95), rgba(8, 11, 20, 0.95));
+  --font-stack: 'JetBrains Mono', 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono',
+    'Courier New', monospace;
+}
+
+.cua-panel {
+  font-family: var(--font-stack);
+  background: var(--panel-gradient);
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  color: #e2e8f0;
+  box-shadow: 0 10px 45px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 255, 204, 0.05);
+  padding: 16px 18px;
+  width: 100%;
+  max-width: 1080px;
+  transition: transform 240ms ease, opacity 240ms ease, box-shadow 240ms ease, max-height 240ms ease;
+  overflow: hidden;
+  position: relative;
+}
+
+.cua-panel::after {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  border-radius: 12px;
+  pointer-events: none;
+  opacity: 0.35;
+  animation: pane-glow 4.8s ease-in-out infinite;
+}
+
+.cua-panel__layout {
+  display: grid;
+  gap: 12px;
+  position: relative;
+}
+
+.cua-panel.expanded {
+  min-height: 340px;
+  transform: translateY(0) scale(1);
+  opacity: 1;
+}
+
+.cua-panel.collapsed {
+  max-height: 68px;
+  cursor: pointer;
+  transform: translateY(6px) scale(0.99);
+  opacity: 0.92;
+}
+
+.cua-panel[data-theme='carbon'] {
+  --panel-gradient: linear-gradient(145deg, #111827, #0b1224 45%, #0a0f1d);
+  --panel-border: #1f2937;
+  --panel-highlight: #5eead4;
+  --panel-highlight-2: #a5b4fc;
+}
+
+.cua-panel[data-theme='plasma'] {
+  --panel-gradient: radial-gradient(circle at 10% 10%, rgba(255, 99, 146, 0.14), transparent 35%),
+    radial-gradient(circle at 90% 20%, rgba(59, 130, 246, 0.18), transparent 32%),
+    linear-gradient(140deg, #0f172a, #111827 60%, #0b132f);
+  --panel-border: #273253;
+  --panel-highlight: #7dd3fc;
+  --panel-highlight-2: #f472b6;
+}
+
+.cua-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px dashed rgba(148, 163, 184, 0.3);
+}
+
+.cua-panel__header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.cua-toggle {
+  border: 1px solid rgba(56, 189, 248, 0.5);
+  color: #e0f2fe;
+  background: rgba(14, 165, 233, 0.08);
+  padding: 10px 12px;
+  border-radius: 12px;
+  min-width: 48px;
+  transition: all 160ms ease;
+  font-size: 18px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 0 1px rgba(56, 189, 248, 0.15);
+}
+
+.cua-toggle:hover {
+  background: rgba(14, 165, 233, 0.16);
+  transform: translateY(-1px);
+}
+
+.cua-panel__rails {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(59, 130, 246, 0.08) 45%,
+      rgba(59, 130, 246, 0.18) 50%,
+      rgba(59, 130, 246, 0.08) 55%,
+      transparent 100%
+    ),
+    repeating-linear-gradient(
+      0deg,
+      rgba(148, 163, 184, 0.06),
+      rgba(148, 163, 184, 0.06) 1px,
+      rgba(15, 23, 42, 0.08) 1px,
+      rgba(15, 23, 42, 0.08) 12px
+    );
+  opacity: 0.4;
+  pointer-events: none;
+  mask-image: linear-gradient(180deg, transparent, #fff 20%, #fff 80%, transparent);
+  animation: line-sweep 9s linear infinite;
+}
+
+.cua-panel__rail-dot {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  right: 14px;
+  top: 14px;
+  border-radius: 999px;
+  background: radial-gradient(circle, var(--panel-highlight), transparent);
+  animation: pulse 2.4s infinite;
+}
+
+.cua-mascot {
+  position: absolute;
+  right: 12px;
+  bottom: 14px;
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+  color: #e0f2fe;
+  filter: drop-shadow(0 4px 20px rgba(56, 189, 248, 0.35));
+  transition: opacity 200ms ease, transform 220ms ease;
+  pointer-events: none;
+}
+
+.cua-mascot__body {
+  font-size: 28px;
+  animation: floaty 3.6s ease-in-out infinite;
+}
+
+.cua-mascot__tag {
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.14);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+}
+
+.cua-mascot--hidden {
+  opacity: 0;
+  transform: translateY(10px) scale(0.96);
+}
+
+.cua-panel__summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 14px 0;
+}
+
+.cua-panel__summary .label {
+  color: rgba(148, 163, 184, 0.8);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.cua-panel__summary strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 22px;
+  color: #f8fafc;
+}
+
+.cua-panel__instances {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+  transition: opacity 200ms ease;
+}
+
+.cua-panel.collapsed .cua-panel__summary,
+.cua-panel.collapsed .cua-panel__instances {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.cua-card {
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(13, 23, 42, 0.7);
+  border-radius: 14px;
+  padding: 12px;
+  position: relative;
+  overflow: hidden;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.cua-card:before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 20% 20%, rgba(56, 189, 248, 0.08), transparent 40%);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.cua-card:hover:before {
+  opacity: 1;
+}
+
+.cua-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  position: relative;
+  z-index: 1;
+}
+
+.cua-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid transparent;
+}
+
+.cua-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 0 0 currentColor;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@keyframes line-sweep {
+  0% {
+    transform: translateX(-10%);
+    opacity: 0.5;
+  }
+  40% {
+    opacity: 0.8;
+  }
+  100% {
+    transform: translateX(8%);
+    opacity: 0.35;
+  }
+}
+
+@keyframes floaty {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+  }
+  50% {
+    transform: translateY(-6px) scale(1.03);
+  }
+}
+
+@keyframes pane-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.14);
+  }
+  50% {
+    box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.28), 0 0 24px rgba(56, 189, 248, 0.12);
+  }
+}
+
+.cua-card__body {
+  display: grid;
+  gap: 12px;
+  position: relative;
+  z-index: 1;
+}
+
+.cua-snapshot {
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.9);
+  border-radius: 12px;
+  padding: 8px;
+  min-height: 160px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.cua-snapshot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 10px;
+  filter: saturate(1.1) contrast(1.05);
+}
+
+.cua-snapshot__placeholder {
+  width: 100%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    -45deg,
+    rgba(56, 189, 248, 0.12),
+    rgba(56, 189, 248, 0.12) 10px,
+    rgba(15, 23, 42, 0.8) 10px,
+    rgba(15, 23, 42, 0.8) 20px
+  );
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+}
+
+.cua-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.cua-actions button {
+  background: rgba(15, 184, 255, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  color: #e0f2fe;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 13px;
+  transition: all 120ms ease;
+}
+
+.cua-actions button:hover {
+  background: rgba(56, 189, 248, 0.2);
+  transform: translateY(-1px);
+}
+
+.cua-actions button:active {
+  transform: translateY(0);
+}
+
+.cua-command {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: rgba(226, 232, 240, 0.8);
+}
+
+.cua-command input {
+  background: rgba(15, 23, 42, 0.8);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: #e2e8f0;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.cua-command input:focus {
+  border-color: rgba(56, 189, 248, 0.75);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+}
+
+.cua-spinner {
+  border: 3px solid rgba(148, 163, 184, 0.4);
+  border-top: 3px solid rgba(56, 189, 248, 0.9);
+  border-radius: 999px;
+  width: 16px;
+  height: 16px;
+  display: inline-block;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.cua-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  padding: 10px;
+  border: 1px dashed rgba(56, 189, 248, 0.25);
+  border-radius: 10px;
+  background: rgba(12, 20, 36, 0.75);
+}
+
+.cua-metrics .label {
+  color: rgba(148, 163, 184, 0.8);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.cua-metrics strong {
+  display: block;
+  color: #f8fafc;
+}
+
+.cua-logline {
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.7);
+  color: #e2e8f0;
+}
+
+.cua-logline .label {
+  display: block;
+  color: rgba(148, 163, 184, 0.8);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+
+.cua-panel__actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cua-ghost {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  color: #cbd5e1;
+  border-radius: 10px;
+  padding: 10px 12px;
+  transition: all 120ms ease;
+}
+
+.cua-ghost:hover {
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.45);
+  color: #e2e8f0;
+}
+
+.cua-toast-shelf {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: grid;
+  gap: 8px;
+  width: min(320px, 80vw);
+}
+
+.cua-toast {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  color: #e2e8f0;
+  font-size: 14px;
+  box-shadow: 0 10px 35px rgba(0, 0, 0, 0.35);
+}
+
+.cua-toast--success {
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.cua-toast--info {
+  background: rgba(59, 130, 246, 0.18);
+  border: 1px solid rgba(59, 130, 246, 0.42);
+}
+
+.cua-toast--error {
+  background: rgba(244, 63, 94, 0.18);
+  border: 1px solid rgba(244, 63, 94, 0.45);
+}
+
+@media (max-width: 640px) {
+  .cua-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cua-panel__summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+```
+
+## Usage example
+
+```tsx
+import React from 'react';
+import ControlPanelApp from './ControlPanelApp';
+
+export default function Dashboard() {
+  return (
+    <main className="p-6 bg-slate-950 min-h-screen text-slate-100">
+      <ControlPanelApp />
+    </main>
+  );
+}
+```
+
+## Desktop integration (Electron or Tauri)
+
+Run the same panel as a desktop app with system tray controls, global shortcuts, and native notifications. The Electron sample
+below matches the TUI-inspired styles (dark gradients, mono icons) while adding always-on-top pinning, minimize-to-tray, and
+token handoff for authenticated calls to the Cua backend.
+
+### Electron bootstrap
+
+- `examples/ui/vm-control-panel/electron/main.ts` creates the window, tray menu, notification handler, and `Command/Control +
+  Shift + K` shortcut to restore the panel. It keeps the window in the tray by default so global shortcuts stay hot.
+- `examples/ui/vm-control-panel/electron/preload.ts` exposes a `desktopBridge` API to the React renderer (notifications,
+  always-on-top toggles, tray visibility, and auth token requests).
+
+```ts title="examples/ui/vm-control-panel/electron/main.ts"
+app.whenReady().then(() => {
+  createWindow();
+  createTray();
+  registerShortcuts();
+
+  ipcMain.handle('notify', (_event, payload) => sendNotification(payload));
+  ipcMain.handle('set-always-on-top', (_event, flag) => toggleAlwaysOnTop(flag));
+  ipcMain.handle('set-panel-visibility', (_event, state) => (state === 'show' ? showPanel() : mainWindow?.hide()));
+  ipcMain.handle('request-auth-token', () => process.env.CUA_PANEL_TOKEN);
+});
+```
+
+```ts title="examples/ui/vm-control-panel/electron/preload.ts"
+contextBridge.exposeInMainWorld('desktopBridge', {
+  notify: (payload) => ipcRenderer.invoke('notify', payload),
+  setPanelVisibility: (state) => ipcRenderer.invoke('set-panel-visibility', state),
+  setAlwaysOnTop: (flag) => ipcRenderer.invoke('set-always-on-top', flag),
+  onAuthToken: (listener) => ipcRenderer.on('auth-token', (_event, token) => listener(token)),
+  requestAuthToken: () => ipcRenderer.invoke('request-auth-token'),
+});
+```
+
+In the renderer, `ControlPanelApp` consumes `desktopBridge` to pin/unpin the window, minimize to tray, and surface
+notifications when VM actions complete.
+
+### Tauri hook (Rust)
+
+If you prefer Tauri, wire the same bridge with commands and `tauri::api::notification::Notification`:
+
+```rust
+#[tauri::command]
+fn notify(title: String, body: String) {
+    tauri::api::notification::Notification::new("cua-control-panel")
+        .title(title)
+        .body(body)
+        .show()
+        .unwrap();
+}
+
+#[tauri::command]
+fn set_always_on_top(app: tauri::AppHandle, flag: bool) {
+    if let Some(window) = app.get_window("main") {
+        window.set_always_on_top(flag).unwrap();
+    }
+}
+```
+
+### Packaging + platform notes
+
+- **Windows/macOS/Linux**: Electron builders such as `electron-builder` can package the app (`electron-builder -mwl`), while
+  Tauri uses `pnpm tauri build` for native bundles. Provide `CUA_PANEL_URL` and `CUA_PANEL_TOKEN` during packaging so the app
+  knows which backend and token to target.
+- **Auth + security**: the preload bridge only exposes a few methods, and REST/WebSocket calls receive the bearer token via
+  `request-auth-token`. Keep the token in OS keychains (Keychain/DPAPI/libsecret) and emit a fresh token via `ipcMain` or a
+  Tauri command on app start.
+- **Notifications**: both Electron and Tauri use the OS-native notification surfaces while preserving the panel’s terminal
+  look through icon/emoji choices and short, high-contrast text.
+- **Tray + shortcuts**: default shortcuts restore/hide the panel and re-pin it for always-on-top status so multi-agent runs
+  remain visible above other windows.
